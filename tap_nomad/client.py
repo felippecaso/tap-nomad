@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import os
+import tempfile
 from typing import Iterable, List
 
+import boto3
 import numpy as np
 import pandas as pd
 import tabula
@@ -28,11 +30,21 @@ class NomadStream(Stream):
         self.file_config = kwargs.pop("file_config")
         super().__init__(*args, **kwargs)
 
+    def list_s3_files_in_folder(self, s3_bucket: str, s3_folder: str) -> List[str]:
+        s3_client = boto3.client("s3")
+        response = s3_client.list_objects_v2(Bucket=s3_bucket, Prefix=s3_folder)
+        file_paths = []
+        for item in response.get("Contents", []):
+            if not item["Key"].endswith("/"):
+                file_paths.append(f"s3://{s3_bucket}/{item['Key']}")
+        return file_paths
+
     def get_file_paths(self) -> list:
         """Return a list of file paths to read.
 
         This tap accepts file names and directories so it will detect
-        directories and iterate files inside.
+        directories and iterate files inside, both in local files and
+        in AWS S3.
 
         Returns:
             return (List): A list with file paths to read.
@@ -45,24 +57,35 @@ class NomadStream(Stream):
             return self.file_paths
 
         file_path = self.file_config["path"]
-        if not os.path.exists(file_path):
-            raise Exception(f"File path does not exist {file_path}")
+        if not file_path:
+            raise Exception("file_path is not provided.")
 
-        file_paths = []
-        if os.path.isdir(file_path):
+        if file_path.startswith("s3://"):
+            path_split = file_path.split("/")
+            s3_bucket, s3_key = path_split[2], "/".join(path_split[3:])
+            if s3_key.endswith("/"):
+                # If the S3 URL points to a folder, list all files inside
+                file_paths = self.list_s3_files_in_folder(s3_bucket, s3_key)
+                self.file_paths = file_paths
+            else:
+                # Treat the S3 URL as a single file
+                self.file_paths = [file_path]
+                file_paths = [file_path]
+        elif os.path.isdir(file_path):
             clean_file_path = os.path.normpath(file_path) + os.sep
+            file_paths = []
             for filename in os.listdir(clean_file_path):
-                file_path = clean_file_path + filename
-                file_paths.append(file_path)
+                file_paths.append(clean_file_path + filename)
+            self.file_paths = file_paths
+        elif os.path.exists(file_path):
+            self.file_paths = [file_path]
+            file_paths = [file_path]
         else:
-            file_paths.append(file_path)
+            raise Exception(f"File path does not exist: {file_path}")
 
-        if not file_paths:
-            raise Exception(
-                f"Stream '{self.name}' has no acceptable files. \
-                    See warning for more detail."
-            )
-        self.file_paths = file_paths
+        if not self.file_paths:
+            raise Exception(f"No acceptable files found for stream '{self.name}'.")
+
         return file_paths
 
     name = "nomad_transactions"
@@ -74,6 +97,40 @@ class NomadStream(Stream):
         th.Property("description", th.StringType, required=True),
         th.Property("status", th.StringType, required=True),
     ).to_dict()
+
+    def read_pdf_from_s3(self, s3_bucket: str, s3_key: str):
+        # Use boto3 to download the file from S3 and then read it
+        s3_client = boto3.client("s3")
+        response = s3_client.get_object(Bucket=s3_bucket, Key=s3_key)
+        pdf_content = response["Body"].read()
+
+        # Create a temporary file-like object for tabula to read from
+        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+            temp_file.write(pdf_content)
+            temp_file_path = temp_file.name
+
+        try:
+            nomad_raw_list: List[pd.DataFrame] = tabula.read_pdf(
+                temp_file_path,
+                pages="all",
+                multiple_tables=False,
+                pandas_options={"header": None},
+                area=[160, 32, 520, 570],
+            )  # type: ignore
+        finally:
+            # Clean up the temporary file
+            os.remove(temp_file_path)
+        return nomad_raw_list
+
+    def read_pdf_from_local(self, file_path: str):
+        nomad_raw_list: List[pd.DataFrame] = tabula.read_pdf(
+            file_path,
+            pages="all",
+            multiple_tables=False,
+            pandas_options={"header": None},
+            area=[160, 32, 520, 570],
+        )  # type: ignore
+        return nomad_raw_list
 
     def get_records(self, context: dict | None) -> Iterable[dict]:
         """Yield a generator of record-type dictionary objects.
@@ -88,13 +145,12 @@ class NomadStream(Stream):
         """
         for file_path in self.get_file_paths():
             if file_path.endswith(".pdf"):
-                nomad_raw_list: List[pd.DataFrame] = tabula.read_pdf(
-                    file_path,
-                    pages="all",
-                    multiple_tables=False,
-                    pandas_options={"header": None},
-                    area=[160, 32, 520, 570],
-                )  # type: ignore
+                if file_path.startswith("s3://"):
+                    s3_bucket, s3_key = file_path.split("/", 3)[2:]
+                    nomad_raw_list = self.read_pdf_from_s3(s3_bucket, s3_key)
+                else:
+                    nomad_raw_list = self.read_pdf_from_local(file_path)
+
                 nomad_raw: pd.DataFrame = nomad_raw_list[0]
                 i = 0
                 df_list = []

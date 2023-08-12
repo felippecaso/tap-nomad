@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "tap-nomad"
-version = "0.0.1"
+version = "0.0.2"
 description = "`tap-nomad` is a Singer tap for Nomad, built with the Meltano Singer SDK."
 readme = "README.md"
 authors = ["Felippe Felisola"]
@@ -17,6 +17,7 @@ fs-s3fs = { version = "^1.1.1", optional = true}
 pandas = "^1.5.3"
 tabula = "^1.0.5"
 tabula-py = "^2.7.0"
+boto3 = "^1.28.25"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.2.1"
